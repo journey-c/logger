@@ -3,7 +3,9 @@ package logger
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,13 +32,11 @@ var logLevel = [4]string{"debug", "warn", "error", "trace"}
 type LoggerBuffer struct {
 	bufferLock    sync.Mutex
 	bufferContent *bytes.Buffer
-	bufferName    string
 }
 
-func NewLoggerBuffer(bufferName string) *LoggerBuffer {
+func NewLoggerBuffer() *LoggerBuffer {
 	return &LoggerBuffer{
 		bufferContent: bytes.NewBuffer(make([]byte, 0, DefaultBufferSize)),
-		bufferName:    bufferName,
 	}
 }
 
@@ -46,168 +46,144 @@ func (this *LoggerBuffer) WriteString(text string) {
 	this.bufferLock.Unlock()
 }
 
-type Logger struct {
-	userBuffer bool
+type LoggerMate struct {
+	backupDir string
+	file      *os.File
 
-	logFile string
-	backup  string
-
-	fileLock map[string]*sync.Mutex
-	file     map[string]*os.File
-
-	bufferRWLock sync.RWMutex
-	buffer       map[string]*LoggerBuffer
-	bufferQueue  chan LoggerBuffer
+	buffer      *LoggerBuffer
+	bufferQueue chan *LoggerBuffer
 
 	syncInterval time.Duration
 }
 
-func NewLogger(filename, backup, prefix string) (*Logger, error) {
-	if strings.HasSuffix(filename, "/") {
-		filename = filename[:len(filename)-1]
+func NewLoggerMate(filename, backupDir string) (*LoggerMate, error) {
+	logFile, err := os.OpenFile(filename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0777)
+	if err != nil {
+		return nil, err
 	}
-	if _, err := os.Stat(filename); err != nil {
-		err = os.MkdirAll(filename, 0777)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if strings.HasSuffix(backup, "/") {
-		backup = backup[:len(backup)-1]
-	}
-	if _, err := os.Stat(backup); err != nil {
-		err = os.MkdirAll(backup, 0777)
-		if err != nil {
-			return nil, err
-		}
-	}
-	filelock := make(map[string]*sync.Mutex)
-	logfile := make(map[string]*os.File)
-	for _, level := range logLevel {
-		switch level {
-		case "debug":
-			file, err := os.OpenFile(filename+"/"+prefix+"_debug.log", os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0777)
-			if err != nil {
-				return nil, err
-			}
-			logfile[level] = file
-			filelock[level] = &sync.Mutex{}
-		case "error":
-			file, err := os.OpenFile(filename+"/"+prefix+"_error.log", os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0777)
-			if err != nil {
-				return nil, err
-			}
-			logfile[level] = file
-			filelock[level] = &sync.Mutex{}
-		case "warn":
-			file, err := os.OpenFile(filename+"/"+prefix+"_warn.log", os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0777)
-			if err != nil {
-				return nil, err
-			}
-			logfile[level] = file
-			filelock[level] = &sync.Mutex{}
-		case "trace":
-			file, err := os.OpenFile(filename+"/"+prefix+"_trace.log", os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0777)
-			if err != nil {
-				return nil, err
-			}
-			logfile[level] = file
-			filelock[level] = &sync.Mutex{}
-		}
-	}
-
-	return &Logger{
-		userBuffer:   false,
-		logFile:      filename,
-		backup:       backup,
-		fileLock:     filelock,
-		file:         logfile,
-		buffer:       make(map[string]*LoggerBuffer),
-		bufferQueue:  make(chan LoggerBuffer),
+	loggerMate := &LoggerMate{
+		backupDir:    backupDir,
+		file:         logFile,
+		buffer:       NewLoggerBuffer(),
+		bufferQueue:  make(chan *LoggerBuffer, KB*4),
 		syncInterval: time.Second,
-	}, nil
+	}
+	go loggerMate.WriteToQueue()
+	go loggerMate.FlushToDisk()
+
+	return loggerMate, nil
 }
 
-func (this *Logger) SetSysInterval(interval int) {
+func (this *LoggerMate) SetSysInterval(interval int) {
 	this.syncInterval = time.Duration(interval)
 }
 
-func (this *Logger) EnableBuffer() {
-	this.userBuffer = true
-	go this.writeToQueue()
-	go this.flushToDisk()
-}
-
-func (this *Logger) write(level, text string) {
-	if this.userBuffer {
-		this.bufferRWLock.RLock()
-		if _, ok := this.buffer[level]; !ok {
-			this.buffer[level] = NewLoggerBuffer(level)
-		}
-		this.bufferRWLock.RUnlock()
-		this.buffer[level].WriteString(text)
-	} else {
-		// TODO 同步写现有逻辑太浪费fd
-		this.fileLock[level].Lock()
-		_, err := this.file[level].Write([]byte(text))
-		if err != nil {
-			this.fileLock[level].Unlock()
-			fmt.Println(err.Error())
-			return
-		}
-		_ = this.file[level].Sync()
-		this.fileLock[level].Unlock()
-	}
-}
-
-func (this *Logger) Debug(args ...interface{}) {
-	this.write(DEBUG, format(args...))
-}
-
-func (this *Logger) Error(args ...interface{}) {
-	this.write(ERROR, format(args...))
-}
-
-func (this *Logger) Warn(args ...interface{}) {
-	this.write(WARN, format(args...))
-}
-
-func (this *Logger) Trace(args ...interface{}) {
-	this.write(TRACE, format(args...))
-}
-
-func (this *Logger) writeToQueue() {
+func (this *LoggerMate) WriteToQueue() {
 	ticker := time.NewTicker(this.syncInterval)
 	defer ticker.Stop()
 	for {
 		<-ticker.C
-		this.bufferRWLock.RLock()
-		for name, buffer := range this.buffer {
-			this.bufferQueue <- *buffer
-			this.buffer[name] = NewLoggerBuffer(name)
-		}
-		this.bufferRWLock.RUnlock()
+		this.bufferQueue <- this.buffer
+		this.buffer = NewLoggerBuffer()
 	}
 }
 
-func (this *Logger) flushToDisk() {
+func (this *LoggerMate) FlushToDisk() {
 	for {
 		select {
 		case buffer := <-this.bufferQueue:
-			this.fileLock[buffer.bufferName].Lock()
-			_, err := this.file[buffer.bufferName].Write(buffer.bufferContent.Bytes())
+			_, err := this.file.Write(buffer.bufferContent.Bytes())
 			if err != nil {
-				this.fileLock[buffer.bufferName].Lock()
+				fmt.Println(err.Error())
 				continue
 			}
-			_ = this.file[buffer.bufferName].Sync()
-			this.fileLock[buffer.bufferName].Lock()
+			_ = this.file.Sync()
 		}
 	}
 }
 
-func format(args ...interface{}) string {
+type Logger struct {
+	mateLock    sync.RWMutex
+	loggerMates map[string]*LoggerMate
+}
+
+func NewLogger(fileDir, backupDir, module string) (*Logger, error) {
+	if _, err := os.Stat(fileDir); err != nil {
+		err = os.MkdirAll(fileDir, 0777)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if _, err := os.Stat(backupDir); err != nil {
+		err = os.MkdirAll(backupDir, 0777)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	tmpLoggerMates := make(map[string]*LoggerMate)
+
+	for _, level := range logLevel {
+		switch level {
+		case DEBUG:
+			filename := filepath.Join(fileDir, module+"-"+GetInnerIp()+"-debug.log")
+			loggerMate, err := NewLoggerMate(filename, backupDir)
+			if err != nil {
+				return nil, err
+			}
+			tmpLoggerMates[DEBUG] = loggerMate
+		case WARN:
+			filename := filepath.Join(fileDir, module+"-"+GetInnerIp()+"-warn.log")
+			loggerMate, err := NewLoggerMate(filename, backupDir)
+			if err != nil {
+				return nil, err
+			}
+			tmpLoggerMates[WARN] = loggerMate
+		case ERROR:
+			filename := filepath.Join(fileDir, module+"-"+GetInnerIp()+"-error.log")
+			loggerMate, err := NewLoggerMate(filename, backupDir)
+			if err != nil {
+				return nil, err
+			}
+			tmpLoggerMates[ERROR] = loggerMate
+		case TRACE:
+			filename := filepath.Join(fileDir, module+"-"+GetInnerIp()+"-trace.log")
+			loggerMate, err := NewLoggerMate(filename, backupDir)
+			if err != nil {
+				return nil, err
+			}
+			tmpLoggerMates[TRACE] = loggerMate
+		}
+	}
+
+	return &Logger{
+		loggerMates: tmpLoggerMates,
+	}, nil
+}
+
+func (this *Logger) write(level, text string) {
+	this.mateLock.RLock()
+	this.loggerMates[level].buffer.WriteString(text)
+	this.mateLock.RUnlock()
+}
+
+func (this *Logger) Debug(args ...interface{}) {
+	this.write(DEBUG, Format(args...))
+}
+
+func (this *Logger) Error(args ...interface{}) {
+	this.write(ERROR, Format(args...))
+}
+
+func (this *Logger) Warn(args ...interface{}) {
+	this.write(WARN, Format(args...))
+}
+
+func (this *Logger) Trace(args ...interface{}) {
+	this.write(TRACE, Format(args...))
+}
+
+func Format(args ...interface{}) string {
 	content := time.Now().Format(DataFormat)
 	for _, arg := range args {
 		switch arg.(type) {
@@ -222,4 +198,18 @@ func format(args ...interface{}) string {
 		}
 	}
 	return content + "\n"
+}
+
+func GetInnerIp() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	for _, add := range addrs {
+		ipMask := strings.Split(add.String(), "/")
+		if ipMask[0] != "127.0.0.1" && ipMask[0] != "24" {
+			return ipMask[0]
+		}
+	}
+	return ""
 }
