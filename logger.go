@@ -17,9 +17,10 @@ const (
 	MB = 1024 * KB
 	GB = 1024 * MB
 
-	DefaultBufferSize = 4 * KB
+	DefaultBufferSize   = 4 * KB
+	DefaultLogSplitSize = 2 * GB
 
-	DataFormat = "2006-02-02 15:04:05"
+	DataFormat = "2006-01-02 15:04:05"
 
 	DEBUG = "debug"
 	WARN  = "warn"
@@ -29,56 +30,109 @@ const (
 
 var logLevel = [4]string{"debug", "warn", "error", "trace"}
 
-type LoggerBuffer struct {
+type Buffer struct {
 	bufferLock    sync.Mutex
 	bufferContent *bytes.Buffer
 }
 
-func NewLoggerBuffer() *LoggerBuffer {
-	return &LoggerBuffer{
+func NewLoggerBuffer() *Buffer {
+	return &Buffer{
 		bufferContent: bytes.NewBuffer(make([]byte, 0, DefaultBufferSize)),
 	}
 }
 
-func (this *LoggerBuffer) WriteString(text string) {
+func (this *Buffer) WriteString(text string) {
 	this.bufferLock.Lock()
 	this.bufferContent.WriteString(text)
 	this.bufferLock.Unlock()
 }
 
-type LoggerMate struct {
+type Mate struct {
+	logId     int
+	filename  string
 	backupDir string
 	file      *os.File
 
-	buffer      *LoggerBuffer
-	bufferQueue chan *LoggerBuffer
+	DateStamp time.Time
+
+	buffer      *Buffer
+	bufferQueue chan *Buffer
 
 	syncInterval time.Duration
 }
 
-func NewLoggerMate(filename, backupDir string) (*LoggerMate, error) {
-	logFile, err := os.OpenFile(filename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0777)
+func NewMate(filename, backupDir string) (*Mate, error) {
+	dataStamp, _ := time.Parse("2006-01-02", time.Now().Format("2006-01-02"))
+	loggerMate := &Mate{
+		logId:        int(0),
+		filename:     filename,
+		backupDir:    backupDir,
+		DateStamp:    dataStamp,
+		buffer:       NewLoggerBuffer(),
+		bufferQueue:  make(chan *Buffer, KB*4),
+		syncInterval: time.Second,
+	}
+
+	err := loggerMate.CreateFile()
 	if err != nil {
 		return nil, err
 	}
-	loggerMate := &LoggerMate{
-		backupDir:    backupDir,
-		file:         logFile,
-		buffer:       NewLoggerBuffer(),
-		bufferQueue:  make(chan *LoggerBuffer, KB*4),
-		syncInterval: time.Second,
-	}
+
 	go loggerMate.WriteToQueue()
 	go loggerMate.FlushToDisk()
 
 	return loggerMate, nil
 }
 
-func (this *LoggerMate) SetSysInterval(interval int) {
+func (this *Mate) SetSysInterval(interval int) {
 	this.syncInterval = time.Duration(interval)
 }
 
-func (this *LoggerMate) WriteToQueue() {
+func (this *Mate) NeedSplit() (bool, bool) {
+	fileStat, _ := this.file.Stat()
+	nowData, _ := time.Parse("2006-01-02", time.Now().Format("2006-01-02"))
+	if nowData.After(this.DateStamp) {
+		fmt.Println(nowData.String() + "|" + this.DateStamp.String())
+	}
+	return fileStat.Size() >= DefaultLogSplitSize, nowData.After(this.DateStamp)
+}
+
+func (this *Mate) LogBackup() {
+	var err error
+	nowDataStr := time.Now().Format("2006-01-02")
+	nowData, _ := time.Parse("2006-01-02", nowDataStr)
+	_, err = os.Stat(this.backupDir)
+	if err != nil {
+		_ = os.Mkdir(this.backupDir, 0777)
+	}
+	_, err = os.Stat(filepath.Join(this.backupDir, nowDataStr))
+	if err != nil {
+		_ = os.Mkdir(filepath.Join(this.backupDir, nowDataStr), 0777)
+	}
+	if err := this.file.Close(); err != nil {
+		return
+	}
+	for i := 0; i < this.logId; i++ {
+		_ = os.Rename(this.filename+"."+strconv.Itoa(i), filepath.Join(filepath.Join(this.backupDir, nowDataStr),
+			filepath.Base(this.filename)+"."+strconv.Itoa(i)))
+	}
+	_ = os.Rename(this.filename, filepath.Join(filepath.Join(this.backupDir, nowDataStr), filepath.Base(this.filename)+"."+strconv.Itoa(this.logId)))
+	this.file = nil
+	_ = this.CreateFile()
+
+	this.logId = 0
+	this.DateStamp = nowData
+}
+
+func (this *Mate) CreateFile() (err error) {
+	this.file, err = os.OpenFile(this.filename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0777)
+	if err != nil {
+		return
+	}
+	return nil
+}
+
+func (this *Mate) WriteToQueue() {
 	ticker := time.NewTicker(this.syncInterval)
 	defer ticker.Stop()
 	for {
@@ -88,23 +142,47 @@ func (this *LoggerMate) WriteToQueue() {
 	}
 }
 
-func (this *LoggerMate) FlushToDisk() {
+func (this *Mate) FlushToDisk() {
 	for {
 		select {
 		case buffer := <-this.bufferQueue:
-			_, err := this.file.Write(buffer.bufferContent.Bytes())
-			if err != nil {
-				fmt.Println(err.Error())
+			var err error
+			needSplit, needBackup := this.NeedSplit()
+			if needBackup {
+				this.LogBackup()
 				continue
 			}
-			_ = this.file.Sync()
+
+			if needSplit {
+				err = this.file.Close()
+				if err != nil {
+					continue
+				}
+				err = os.Rename(this.filename, this.filename+"."+strconv.Itoa(this.logId))
+				if err != nil {
+					this.logId++
+					_ = this.CreateFile()
+				}
+			}
+
+			if this.file == nil {
+				_ = this.CreateFile()
+			}
+			_, err = this.file.Write(buffer.bufferContent.Bytes())
+			if err != nil {
+				continue
+			}
+			err = this.file.Sync()
+			if err != nil {
+				fmt.Println(err.Error())
+			}
 		}
 	}
 }
 
 type Logger struct {
-	mateLock    sync.RWMutex
-	loggerMates map[string]*LoggerMate
+	mateLock sync.RWMutex
+	Mates    map[string]*Mate
 }
 
 func NewLogger(fileDir, backupDir, module string) (*Logger, error) {
@@ -121,49 +199,49 @@ func NewLogger(fileDir, backupDir, module string) (*Logger, error) {
 		}
 	}
 
-	tmpLoggerMates := make(map[string]*LoggerMate)
+	tmpMates := make(map[string]*Mate)
 
 	for _, level := range logLevel {
 		switch level {
 		case DEBUG:
 			filename := filepath.Join(fileDir, module+"-"+GetInnerIp()+"-debug.log")
-			loggerMate, err := NewLoggerMate(filename, backupDir)
+			loggerMate, err := NewMate(filename, filepath.Join(backupDir, module))
 			if err != nil {
 				return nil, err
 			}
-			tmpLoggerMates[DEBUG] = loggerMate
+			tmpMates[DEBUG] = loggerMate
 		case WARN:
 			filename := filepath.Join(fileDir, module+"-"+GetInnerIp()+"-warn.log")
-			loggerMate, err := NewLoggerMate(filename, backupDir)
+			loggerMate, err := NewMate(filename, filepath.Join(backupDir, module))
 			if err != nil {
 				return nil, err
 			}
-			tmpLoggerMates[WARN] = loggerMate
+			tmpMates[WARN] = loggerMate
 		case ERROR:
 			filename := filepath.Join(fileDir, module+"-"+GetInnerIp()+"-error.log")
-			loggerMate, err := NewLoggerMate(filename, backupDir)
+			loggerMate, err := NewMate(filename, filepath.Join(backupDir, module))
 			if err != nil {
 				return nil, err
 			}
-			tmpLoggerMates[ERROR] = loggerMate
+			tmpMates[ERROR] = loggerMate
 		case TRACE:
 			filename := filepath.Join(fileDir, module+"-"+GetInnerIp()+"-trace.log")
-			loggerMate, err := NewLoggerMate(filename, backupDir)
+			loggerMate, err := NewMate(filename, filepath.Join(backupDir, module))
 			if err != nil {
 				return nil, err
 			}
-			tmpLoggerMates[TRACE] = loggerMate
+			tmpMates[TRACE] = loggerMate
 		}
 	}
 
 	return &Logger{
-		loggerMates: tmpLoggerMates,
+		Mates: tmpMates,
 	}, nil
 }
 
 func (this *Logger) write(level, text string) {
 	this.mateLock.RLock()
-	this.loggerMates[level].buffer.WriteString(text)
+	this.Mates[level].buffer.WriteString(text)
 	this.mateLock.RUnlock()
 }
 
@@ -207,7 +285,7 @@ func GetInnerIp() string {
 	}
 	for _, add := range addrs {
 		ipMask := strings.Split(add.String(), "/")
-		if ipMask[0] != "127.0.0.1" && ipMask[0] != "24" {
+		if ipMask[0] != "127.0.0.1" {
 			return ipMask[0]
 		}
 	}

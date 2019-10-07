@@ -9,7 +9,7 @@ import (
 
 func TestASyncLogger(t *testing.T) {
 	var wait sync.WaitGroup
-	logger, err := NewLogger("/tmp/log", "/tmp/log/backup", "async-127.0.0.1-")
+	logger, err := NewLogger("/tmp/log", "/tmp/log/backup", "room")
 	defer func() {
 		logger = nil
 	}()
@@ -29,4 +29,8 @@ func TestASyncLogger(t *testing.T) {
 	}
 	wait.Wait()
 	time.Sleep(time.Second * 5)
+	logger.Mates["debug"].LogBackup()
+	logger.Mates["warn"].LogBackup()
+	logger.Mates["error"].LogBackup()
+	logger.Mates["trace"].LogBackup()
 }
