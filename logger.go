@@ -158,11 +158,13 @@ func (this *Mate) FlushToDisk() {
 				if err != nil {
 					continue
 				}
-				err = os.Rename(this.filename, this.filename+"."+strconv.Itoa(this.logId))
+				_ = os.Rename(this.filename, this.filename+"."+strconv.Itoa(this.logId))
 				if err != nil {
-					this.logId++
 					_ = this.CreateFile()
+					continue
 				}
+				this.logId++
+				_ = this.CreateFile()
 			}
 
 			if this.file == nil {
