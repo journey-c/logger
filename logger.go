@@ -91,9 +91,6 @@ func (this *Mate) SetSysInterval(interval int) {
 func (this *Mate) NeedSplit() (bool, bool) {
 	fileStat, _ := this.file.Stat()
 	nowData, _ := time.Parse("2006-01-02", time.Now().Format("2006-01-02"))
-	if nowData.After(this.DateStamp) {
-		fmt.Println(nowData.String() + "|" + this.DateStamp.String())
-	}
 	return fileStat.Size() >= DefaultLogSplitSize, nowData.After(this.DateStamp)
 }
 
@@ -174,10 +171,7 @@ func (this *Mate) FlushToDisk() {
 			if err != nil {
 				continue
 			}
-			err = this.file.Sync()
-			if err != nil {
-				fmt.Println(err.Error())
-			}
+			_ = this.file.Sync()
 		}
 	}
 }
