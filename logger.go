@@ -144,6 +144,13 @@ func (this *Mate) FlushToDisk() {
 		select {
 		case buffer := <-this.bufferQueue:
 			var err error
+			if _, err = os.Stat(this.filename); os.IsNotExist(err) {
+				err = this.CreateFile()
+				if err != nil {
+					continue
+				}
+			}
+
 			needSplit, needBackup := this.NeedSplit()
 			if needBackup {
 				this.LogBackup()
